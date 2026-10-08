@@ -32,7 +32,7 @@ services:
       # `laya-serve` itself reads, so the two sides cannot drift apart. The host side
       # stays on loopback unless LAYA_BIND_ADDRESS says otherwise, because the API has
       # no authentication until LAYA_API_KEY is set.
-      - "${LAYA_BIND_ADDRESS:-127.0.0.1}:${LAYA_PORT:-8000}:${LAYA_PORT:-8000}"
+      - "${LAYA_BIND_ADDRESS:-0.0.0.0}:${LAYA_PORT:-8000}:${LAYA_PORT:-8000}"
     environment:
       LAYA_HOST: "${LAYA_HOST:-0.0.0.0}"
       LAYA_PORT: "${LAYA_PORT:-8000}"
