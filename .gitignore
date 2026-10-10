@@ -92,3 +92,5 @@ research/*_benchmark_results.json
 # local checkpoint weights, kept out of the tree
 # (fetch them with: python verify/checkpoints.py --fetch)
 models/
+# Local MongoDB training exports (question content and experiment evidence).
+/data/math-router/
