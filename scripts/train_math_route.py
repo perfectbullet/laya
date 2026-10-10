@@ -73,7 +73,36 @@ def summarize_routing(samples):
             "testArgmax": route_summary(samples["test"], 0.5), "samples": samples}
 
 
-def prepare(source, output, online_repeat):
+def online_summary(samples, threshold):
+    risk = sum(row["gold"] == "online" for row in samples)
+    safe = len(samples) - risk
+    routed_online = [r for r in samples if r.get("pOnline", 1 - r["pLocal"]) >= threshold]
+    caught = sum(r["gold"] == "online" for r in routed_online)
+    false_online = len(routed_online) - caught
+    local = len(samples) - len(routed_online)
+    missed = risk - caught
+    return {"threshold": threshold, "thresholdOn": "pOnline", "items": len(samples),
+            "localCount": local, "localCoverage": local / len(samples), "unsafeLocalCount": missed,
+            "historicallySafeFraction": (local - missed) / local if local else None,
+            "riskCount": risk, "safeCount": safe, "onlineCount": len(routed_online),
+            "caughtRiskCount": caught, "falseOnlineCount": false_online,
+            "onlineRecall": caught / risk if risk else None,
+            "localFalseOnlineRate": false_online / safe if safe else None}
+
+
+def summarize_online_routing(samples):
+    risks = [r.get("pOnline", 1 - r["pLocal"]) for r in samples["calibration"] if r["gold"] == "online"]
+    # Largest threshold that catches every calibration risk. Equality routes online.
+    threshold = min(risks) if risks else 0.0
+    return {"objective": "online-recall", "developmentOnly": True,
+            "thresholdSelection": "calibration only; zero missed online risks; minimize false-online locals",
+            "note": "Calibration recall on four risk questions does not guarantee unseen-risk recall.",
+            "calibrationSelected": online_summary(samples["calibration"], threshold),
+            "testSelected": online_summary(samples["test"], threshold),
+            "testArgmax": online_summary(samples["test"], 0.5), "samples": samples}
+
+
+def prepare(source, output, online_repeat, questions_file=None, all_online_train=False):
     """Derive a new snapshot; never modify the original export or held-out rows."""
     manifest = json.loads((source / "manifest.json").read_text())
     for name, digest in manifest["files"].items():
@@ -96,19 +125,41 @@ def prepare(source, output, online_repeat):
         if any(groups[i] & groups[j] for i in range(3) for j in range(i)):
             raise ValueError("group leakage between splits")
     output.mkdir(parents=True, exist_ok=False)
+    questions = json.loads(questions_file.read_text()) if questions_file else None
+    online_rows = [r for r in read_rows(source / "all_labeled.jsonl") if r["expected"]["math_route"] == "online"] if all_online_train else []
     counts = {}
     for name in manifest["files"]:
         target = output / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        if name.endswith("/train.jsonl"):
-            rows = expand_training(read_rows(source / name), online_repeat)
+        if name.endswith("/train.jsonl") or ((questions or all_online_train) and (name == "all_labeled.jsonl" or name.startswith("fold-"))):
+            rows = read_rows(source / name)
+            if all_online_train and name.startswith("fold-"):
+                rows = [r for r in rows if r["expected"]["math_route"] == "local"]
+                if name.endswith(("/train.jsonl", "/calibration.jsonl")):
+                    rows += [dict(r) for r in online_rows]
+            if name.endswith("/train.jsonl"):
+                rows = expand_training(rows, online_repeat)
+            if questions:
+                for row in rows:
+                    row["questions"] = questions
             target.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
-            counts[name] = dict(Counter(row["expected"]["math_route"] for row in rows))
+            if name.endswith("/train.jsonl"):
+                counts[name] = dict(Counter(row["expected"]["math_route"] for row in rows))
+        elif name == "questions.json" and questions:
+            write_json(target, questions)
         else:
             target.write_bytes((source / name).read_bytes())
     write_json(output / "manifest.json", {
         "sourceManifestSha256": hashlib.sha256((source / "manifest.json").read_bytes()).hexdigest(),
         "sourceManifest": manifest, "onlineRepeat": online_repeat, "trainCounts": counts,
+        "protocol": "all-online-in-train" if all_online_train else "disjoint-fivefold",
+        "riskCalibrationIsTrainingReplay": all_online_train,
+        "effectiveFolds": [{"fold": f["fold"],
+                            "localSplitQuestionIds": {split: [qid for qid in details["questionIds"] if audit[qid]["label"] == "local"]
+                                                      for split, details in f["splits"].items()},
+                            "trainingRiskQuestionIds": [qid for qid, row in audit.items() if row["label"] == "online"]}
+                           for f in manifest["folds"]] if all_online_train else None,
+        "promptOverride": questions, "questionsSha256": file_sha256(output / "questions.json") if questions else None,
         "files": {name: hashlib.sha256((output / name).read_bytes()).hexdigest() for name in manifest["files"]},
     })
     return counts
@@ -130,8 +181,11 @@ def run(args):
     fold = root / ("fold-%d" % args.fold)
     rows = {name: read_rows(fold / (name + ".jsonl")) for name in ("train", "calibration", "test")}
     for left, right in (("train", "calibration"), ("train", "test"), ("calibration", "test")):
-        if {row["state"] for row in rows[left]} & {row["state"] for row in rows[right]}:
-            raise ValueError("overlapping split texts")
+        overlap = {row["state"] for row in rows[left]} & {row["state"] for row in rows[right]}
+        allowed = manifest.get("protocol") == "all-online-in-train" and (left, right) == ("train", "calibration")
+        if overlap and (not allowed or any(r["expected"]["math_route"] != "online"
+                                         for split in (left, right) for r in rows[split] if r["state"] in overlap)):
+            raise ValueError("unexpected overlapping split texts")
     base = Path(args.base)
     cfg = json.loads((base / "rl_agent_config.json").read_text())
     tok = AutoTokenizer.from_pretrained(base / "tokenizer", local_files_only=True)
@@ -151,7 +205,9 @@ def run(args):
               "fold": args.fold, "counts": {name: dict(Counter(r["expected"]["math_route"] for r in data))
                                              for name, data in rows.items()},
               "dataManifestSha256": hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest(),
-              "base": str(base), "baseWeightsSha256": file_sha256(base / "model.safetensors"),
+              "protocol": manifest.get("protocol", "disjoint-fivefold"),
+              "riskCalibrationIsTrainingReplay": manifest.get("riskCalibrationIsTrainingReplay", False),
+              "objective": args.objective, "base": str(base), "baseWeightsSha256": file_sha256(base / "model.safetensors"),
               "baseConfigSha256": file_sha256(base / "rl_agent_config.json"), "developmentOnly": True}
     print(json.dumps(report, ensure_ascii=False), flush=True)
     if report["tokenizer"]["truncated"]:
@@ -173,8 +229,17 @@ def run(args):
                     raise ValueError("runtime prediction truncated input")
                 samples[split].append({"stateSha256": hashlib.sha256(row["state"].encode()).hexdigest(),
                                        "gold": row["expected"]["math_route"],
-                                       "pLocal": result["answers"]["math_route"]["probabilities"]["local"]})
-        evaluation = summarize_routing(samples)
+                                       "pLocal": result["answers"]["math_route"]["probabilities"]["local"],
+                                       "pOnline": result["answers"]["math_route"]["probabilities"]["online"]})
+        evaluation = summarize_online_routing(samples) if args.objective == "online-recall" else summarize_routing(samples)
+        if manifest.get("riskCalibrationIsTrainingReplay"):
+            seen = [r for r in samples["calibration"] if r["gold"] == "online"]
+            evaluation.update(protocol="all-online-in-train", riskCalibrationIsTrainingReplay=True,
+                              unseenRiskEvaluationAvailable=False,
+                              thresholdSelection="minimum P(online) on the 20 training risks; local calibration minimizes false-online decisions",
+                              note="All online risks were trained. Selected-threshold risk recall is training replay, not independent generalization evidence.",
+                              trainingRiskReplaySelected=online_summary(seen, evaluation["calibrationSelected"]["threshold"]),
+                              trainingRiskReplayDefault=online_summary(seen, 0.5))
         evaluation.update(inference="laya.Agent.predict; one question per call; API-rounded probabilities",
                           dtype=str(agent.dtype_for(1)), base=str(base), baseWeightsSha256=report["baseWeightsSha256"])
         with (out / "routing-runtime-evaluation.json").open("x", encoding="utf-8") as f:
@@ -198,7 +263,7 @@ def run(args):
                                    batch_size=args.micro_batch, parallel=parallel)
     if args.evaluate_only:
         samples = {name: routing_evaluation(records(name), rows[name], cfg) for name in ("calibration", "test")}
-        evaluation = summarize_routing(samples)
+        evaluation = summarize_online_routing(samples) if args.objective == "online-recall" else summarize_routing(samples)
         with (out / "routing-evaluation.json").open("x", encoding="utf-8") as f:
             json.dump(evaluation, f, ensure_ascii=False, indent=2)
         print(json.dumps({k: v for k, v in evaluation.items() if k != "samples"}), flush=True)
@@ -241,6 +306,8 @@ def main():
     prep.add_argument("--source", required=True)
     prep.add_argument("--out", required=True)
     prep.add_argument("--online-repeat", type=int, default=3)
+    prep.add_argument("--questions-file", type=Path, help="override task definition without changing historical labels or split IDs")
+    prep.add_argument("--all-online-train", action="store_true", help="put all online questions in every train split; held-out test contains local only")
     train = sub.add_parser("train")
     train.add_argument("--data", required=True)
     train.add_argument("--base", required=True, help="local multilingual checkpoint directory")
@@ -256,9 +323,10 @@ def main():
     train.add_argument("--dry-run", action="store_true", help="verify data and tokenizer only; no checkpoint load/training")
     train.add_argument("--evaluate-only", action="store_true", help="evaluate --base without training; save new routing-evaluation.json in --out")
     train.add_argument("--runtime", action="store_true", help="with --evaluate-only: use Agent.predict, identical to serving precision and rounding")
+    train.add_argument("--objective", choices=("local-safe", "online-recall"), default="local-safe")
     args = parser.parse_args()
     if args.command == "prepare":
-        print(json.dumps(prepare(Path(args.source), Path(args.out), args.online_repeat)))
+        print(json.dumps(prepare(Path(args.source), Path(args.out), args.online_repeat, args.questions_file, args.all_online_train)))
     else:
         run(args)
 

@@ -10,7 +10,7 @@ import time
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from train_math_route import read_rows, route_summary, write_json
+from train_math_route import online_summary, read_rows, route_summary, write_json
 
 
 def request(url, payload=None):
@@ -48,8 +48,15 @@ def main():
     evaluation_path = Path(args.checkpoint) / "routing-runtime-evaluation.json"
     evaluation = json.loads(evaluation_path.read_text()) if evaluation_path.exists() else None
     threshold = evaluation["calibrationSelected"]["threshold"] if evaluation else None
+    score = online_summary if evaluation and evaluation.get("objective") == "online-recall" else route_summary
     expected = {r["stateSha256"]: r for r in evaluation["samples"]["test"]} if evaluation else {}
     rows = read_rows(Path(args.data) / ("fold-%d/test.jsonl" % args.fold))
+    held_out_count = len(rows)
+    training_risk_replay = bool(evaluation and evaluation.get("riskCalibrationIsTrainingReplay"))
+    if training_risk_replay:
+        rows += [r for r in read_rows(Path(args.data) / ("fold-%d/calibration.jsonl" % args.fold))
+                 if r["expected"]["math_route"] == "online"]
+        expected.update({r["stateSha256"]: r for r in evaluation["samples"]["calibration"] if r["gold"] == "online"})
     samples, errors = [], []
     log_path = out.with_suffix(".log")
     with log_path.open("x") as log:
@@ -76,7 +83,13 @@ def main():
                     errors.append({"stateSha256": qhash, "error": "HTTP input truncated"})
                 if qhash in expected and abs(p - expected[qhash]["pLocal"]) > 0.001:
                     errors.append({"stateSha256": qhash, "error": "probability mismatch"})
-                samples.append({"stateSha256": qhash, "gold": row["expected"]["math_route"], "pLocal": p})
+                samples.append({"stateSha256": qhash, "gold": row["expected"]["math_route"], "pLocal": p,
+                                "pOnline": result["answers"]["math_route"]["probabilities"]["online"]})
+                if qhash in expected and score is online_summary:
+                    actual_online = samples[-1]["pOnline"] >= threshold
+                    expected_online = expected[qhash]["pOnline"] >= threshold
+                    if actual_online != expected_online:
+                        errors.append({"stateSha256": qhash, "error": "threshold decision mismatch"})
         finally:
             proc.terminate()
             try:
@@ -85,9 +98,13 @@ def main():
                 proc.kill()
                 proc.wait(timeout=10)
     report = {"checkpoint": args.checkpoint, "health": health, "httpRequests": len(samples),
-              "testArgmax": route_summary(samples, 0.5), "testSelected": route_summary(samples, threshold),
-              "errors": errors, "samples": samples, "testServerStopped": True,
+              "testArgmax": score(samples[:held_out_count], 0.5), "testSelected": score(samples[:held_out_count], threshold),
+              "errors": errors, "samples": samples[:held_out_count], "testServerStopped": True,
               "note": "Temporary localhost service; thresholds applied client-side; rounded API probabilities may affect boundary decisions."}
+    if training_risk_replay:
+        report.update(trainingRiskReplaySelected=score(samples[held_out_count:], threshold),
+                      trainingRiskReplayDefault=score(samples[held_out_count:], 0.5),
+                      trainingRiskReplaySamples=samples[held_out_count:], unseenRiskEvaluationAvailable=False)
     write_json(out, report)
     print(json.dumps({k: v for k, v in report.items() if k != "samples"}), flush=True)
     if errors:
