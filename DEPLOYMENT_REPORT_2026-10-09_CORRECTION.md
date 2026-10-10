@@ -88,7 +88,7 @@ Authorization: Bearer <LAYA_API_KEY>
 | Docker 卷 | 9.055 GB | 不得删除 `laya-all-model-cache`。 |
 | GPU | 与 embedding、reranker、TTS、Milvus 等服务共用 | 训练前必须核实显存，并隔离或停机在线服务。 |
 
-## 230 当前实测状态
+## 230 服务修复验证快照
 
 | 项目 | 当前状态 |
 |---|---|
@@ -146,3 +146,36 @@ Authorization: Bearer <LAYA_API_KEY>
 3. 先用 multilingual tokenizer 做数据 dry-run，记录题面截断情况，再做一个短训练试跑测峰值显存和实际训练兼容性。
 4. 230 的 `cu130` 环境已在 RTX 4080 上完成基础计算验证，不能据此将该环境复制到 233 的 V100；233 仍使用支持 `sm_70` 的环境。
 5. 微调输出必须写入独立目录，例如 `/data/metahuman_work/laya-finetunes/<run-id>`，不得覆盖原始模型或生产服务缓存。
+
+## 2026-10-10 补充：训练准备与短试跑
+
+以下为后续实测，以上 PID 50204 和服务健康情况是此前修复验证的快照，不能当作当前状态。短试跑前本机 `127.0.0.1:8000/health` 连接被拒绝，未发现该端口的运行服务；本轮没有启停 Laya 或语音进程。RTX 4080 已用约 831 MiB、空闲约 15,115 MiB，数据盘仍约 114 GB 可用。
+
+已将训练包装脚本及派生数据同步到 `/data/metahuman_work/laya-math-training/20261010/`。每折训练 168 行（132 local、36 online，online 仅在训练集重复三次），校准/测试各 48 行（44 local、4 online），保持固定切分和自然分布。未传输 `.env` 或 MongoDB 连接凭据。
+
+使用 `/data/metahuman_work/models/laya/multilingual` tokenizer 检查全部 240 道题：最长题面 255 tokens、完整序列最长 332 tokens，1024 序列预算内没有截断。沿用 230 原有 Conda 环境，无新依赖安装。
+
+已完成 fold-0 冻结编码器、1 epoch、micro-batch 2、grad-accum 8 的短试跑。PyTorch 峰值分配显存 1,489.63 MiB、缓存保留峰值 1,568 MiB；不含其它进程和 CUDA 驱动开销，不是全参数训练峰值。训练及前后测试/校准计算约 2.06 秒，不含初始化和保存。独立产物写入 `fold-0-frozen-smoke/`，没有覆盖原始模型、服务缓存或生产配置。
+
+短试跑测试分类准确率训练前后均为 50%，校准温度达到 5.0 上限，不具备生产替换条件。保存后重新加载检查：默认 P(local)>=0.5 放行 24/48，误放行 2 道历史风险题；只在校准集选择的开发门槛约 0.544563，在测试集放行 8/48、误放行 0。样本量不足以证明未知题 98% 正确率，未自动部署。详细命令、报告位置及局限见 `docs/math-router-finetune.zh-CN.md`。
+
+## 2026-10-10 补充：完整五折训练与模型替换测试
+
+微调基座为 **Laya multilingual**，原始目录 `/data/metahuman_work/models/laya/multilingual/`，不是数学解题模型。原始权重与 `convaiinnovations/laya` 的缓存 revision `7b928d828b7b0e022f929d9bd2e44165aa270148` 的 multilingual 权重哈希一致：
+
+- 权重 SHA-256：`9d628fd971b700382ac6f65920a86f149777b2e748e0c955fb3b19695aa8f204`。
+- 配置 SHA-256：`25061739243b617ad88d1219ba6f8a9c86c5881ca28df024fa2d9b3b2fcc30c6`。
+
+两种采样方案各五折已训练完成，每折 4 epochs、micro-batch 2、grad-accum 8，编码器参数冻结，只更新其余 14,969,347 个决策网络参数。每折均重新加载原始权重，未覆盖基座。训练前后原始权重/配置哈希一致；PyTorch 峰值 allocated 最大约 1.46 GiB。全部产物在 `/data/metahuman_work/laya-math-training/20261010/frozen-fivefold-v1/`，按 `online1x/fold-0..4`、`online3x/fold-0..4` 分开。
+
+初次 HTTP 测试发现 FP32 训练回放与实际 BF16 服务概率不同，已保留初次失败报告，补做 `Agent.predict` 服务路径的完整五折校准/测试回放。以下最终数字来自 `summary-runtime.json`，不再使用 FP32 报告做服务路由结论：
+
+| 方案（同一 math_route 任务定义） | 本地放行/240 | 历史风险题误放行 | 放行集合历史安全标签比例 |
+|---|---:|---:|---:|
+| 原始 multilingual | 8 | 0 | 100%，仅 8 题 |
+| 冻结编码器，不重复采样 | 34 | 2 | 94.12% |
+| 冻结编码器，online 三倍采样 | 35 | 2 | 94.29% |
+
+各折门槛仅由校准集选择，不使用测试标签调门槛。表内比例不等于最终 solver 正确率，也不是既有难度 v3 生产策略的对照。这次冻结基线尚无充分生产替换依据。
+
+已在 230 临时 localhost:8000 测试服务中依次把 `multilingual` 映射到两个方案预先指定的 fold-0 checkpoint，各执行 48 道真实 `/v1/systemone` HTTP 请求。health 显示 CUDA，CPU fallback 0；输入无截断，概率与运行时回放一致。两个方案按自己的校准门槛分别放行 7 道、8 道，没有历史风险误放行。临时测试进程已关闭，没有覆盖原始模型或留下常驻测试服务。233 生产服务未访问、未修改。完整复现命令和结论见 `docs/math-router-finetune.zh-CN.md`。
