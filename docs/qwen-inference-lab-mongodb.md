@@ -2,6 +2,8 @@
 
 本文说明 Laya 如需接入 QwenInferenceLab 的离线数学能力数据时，如何读取共享的 MongoDB。
 
+当前难度三分类测试版本（2026-10-10）改用 `questions.difficulty` 作为目标标签，压轴归入困难；只输入 `questions.question`，不输入难度字段。该日题库快照为 665 道，过滤两个超长题后训练 663 道。`question_capabilities` 与正式 `evaluations` 仍只覆盖原来的 250 道，它们不是当前难度分类标签来源，也不用于评价分类是否正确。以下 capability-v1 说明与数量表保留为历史能力路由数据说明；当前接口见 [三分类测试环境说明](math-difficulty-test-api.zh-CN.md)。
+
 > 这是一项**可选集成**，而不是 Laya 核心功能的依赖。Laya 的默认路由仍应可在本机、无外部服务时工作；不要在默认初始化、核心 API 或测试中强制连接该 MongoDB。
 
 ## 1. 连接与数据范围

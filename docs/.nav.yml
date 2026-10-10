@@ -19,5 +19,6 @@ nav:
       - finetune.md
       - finetune.zh-CN.md
       - math-router-finetune.zh-CN.md
+      - math-difficulty-test-api.zh-CN.md
       - finetune_browser_agent.md
   - reference

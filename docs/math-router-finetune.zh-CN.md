@@ -2,6 +2,24 @@
 
 本文解释本项目数学路由的数据与标签，不是英文指南的翻译。先读 [中文微调指南](finetune.zh-CN.md)，再结合本说明理解数据准备。部署条件见仓库根目录的 `DEPLOYMENT_REPORT_2026-10-09_CORRECTION.md`。
 
+当前测试环境固定使用全量三分类 `final-all663-epochs20`，**只评价题目难度标签分类是否准确**。接口参数和旧版本迁移见 [当前测试环境使用说明](math-difficulty-test-api.zh-CN.md)。以下 capability-v1、local/online、解题答错率及路由覆盖率内容是历史实验记录，不是当前难度分类器的训练标签或验收标准。
+
+## 当前评估目标：只判断题目难度分类是否准确
+
+输入为原始题面，目标标签来自 `questions.difficulty`，映射为 simple（简单）、medium（中等）、difficult（困难＋压轴）。解题模型是否答对与分类器的标签正确性是两件事；简单题被解题模型答错，不应据此改为困难标签。训练/测试不向模型输入人工难度字段或答案。
+
+| 指标 | 分组五折测试 | 最终全量模型训练题回放 |
+|---|---:|---:|
+| 难度标签准确率 | 77.38% | 90.95% |
+| 宏平均召回率 | 62.13% | 93.07% |
+| 简单精确率 / 召回率 / F1 | 26.39% / 38.00% / 31.15% | 65.33% / 98.00% / 78.40% |
+| 中等精确率 / 召回率 / F1 | 55.56% / 62.07% / 58.63% | 80.00% / 91.03% / 85.16% |
+| 困难精确率 / 召回率 / F1 | 94.17% / 86.32% / 90.08% | 99.76% / 90.17% / 94.73% |
+
+精确率表示被预测为某类的题中，有多少与人工标签一致；召回率表示实际属于某类的题中，有多少被识别；F1 综合这两项。五折测试的简单精确率仍低，说明不能只凭整体准确率认为三类都判得很好。最终回放虽然改善，但用的是训练题；最终模型尚无全新题独立测试成绩。两列不是同口径模型优劣对照，也不是数学解题正确率。
+
+固定本版本作为测试环境，后续采集未参与训练的新题人工难度标签，报告准确率、每类精确率/召回率/F1 和混淆矩阵；若使用类别概率门槛，应另外做独立分类置信度校准。模型正确性评价不再以 local 答错率、online 风险召回或 98% 解题正确率为条件。历史报告文件中保留的 `policies` 字段仅用于审计早期路由分析，不作为当前分类验收指标。
+
 ## capability-v1 的含义
 
 `question_capabilities` 是题目本地处理能力的汇总集合。`capabilityVersion: "capability-v1"` 是这套能力评测记录的版本标记，不是模型名称、题目难度或 Laya checkpoint。
@@ -249,3 +267,267 @@ PYTHONPATH=/data/metahuman_work/laya HF_HUB_OFFLINE=1 \
 - 本地报告：`data/math-router/frozen-fivefold-v1/`、`data/math-router/original-fivefold-v1/`，均被 Git 忽略；没有下载或提交模型权重。
 
 原始模型权重和配置在训练前后哈希一致。当前建议维持 233 既有生产模型，不部署这次冻结基线。后续优先补充更多来自实际本地失败/截断的、彼此独立的风险题，并预留全新测试集；再比较全参数小规模基线与冻结编码器方案。全参数训练、本轮结果部署及生产阈值变更均尚未执行。
+
+## online 风险召回实验：online-risk-v1
+
+新目标是优先识别历史本地失败/截断题，在校准集风险题全部被送到 online 的约束下，尽量少把 local 安全题误送 online。标签仍为 capability-v1 的实际本地表现，不使用人工难度或模型自评分替代标签。
+
+风险检测提示词固定在 `scripts/math_online_risk_questions.json`。派生快照仅替换每条数据的任务定义，不修改题面、真实标签、分组或五折 ID；审计文件保持原样，manifest 记录提示词原文和哈希。候选项为 online/local，但不能把交换选项顺序本身当成效果改善。
+
+路由规则为 `P(online) >= τ` 走 online，等号也走 online。每折在独立校准集选择 `τ = min(该折四道 online 风险题的 P(online))`，这是零漏判条件下允许的最高门槛，可最小化校准集安全题误转在线；概率并列时全部送 online。若校准集没有风险标签，则退回 τ=0、全部 online，不将缺乏证据解读为可靠。测试集不参与 τ 的选择；旧的最少放行 10 题和放行安全比例 98% 规则不再作为此实验的选阈值条件。
+
+评估字段包括 online 召回率 `(风险题总数-漏判数)/风险题总数`、local 误转在线率 `安全题误转数/安全题总数`、风险漏判数和本地覆盖率。没有风险题或安全题时，对应比率为 null，不伪造 100%。每折校准集只含 4 道风险题，校准零漏判不能保证未知题零漏判。
+
+第一轮比较原始 multilingual 回放、普通采样冻结编码器微调、online 三倍采样冻结编码器微调。三倍采样提高风险题的训练曝光，是类别加权的采样实现，不是严格固定优化步数的加权交叉熵消融实验。本轮仍使用原有 soft-ce 损失，没有修改 Laya 公共训练 API，没有实现或声称实现单独的 weighted-CE 损失。
+
+准备数据：
+
+```bash
+python scripts/train_math_route.py prepare \
+  --source data/math-router/capability-v1-20261010 \
+  --out data/math-router/online-risk-v1-online1x \
+  --online-repeat 1 --questions-file scripts/math_online_risk_questions.json
+python scripts/train_math_route.py prepare \
+  --source data/math-router/capability-v1-20261010 \
+  --out data/math-router/online-risk-v1-online3x \
+  --online-repeat 3 --questions-file scripts/math_online_risk_questions.json
+```
+
+230 工作根目录为 `/data/metahuman_work/laya-math-training/online-risk-v1/`，数据分别在 `data-online1x/` 和 `data-online3x/`；基座仍是 `/data/metahuman_work/models/laya/multilingual/`。
+
+在 230 使用相同 Conda 环境和 `PYTHONPATH=/data/metahuman_work/laya HF_HUB_OFFLINE=1`，执行训练包装脚本：
+
+```bash
+python scripts/benchmark_math_route.py \
+  --data-1x /data/metahuman_work/laya-math-training/online-risk-v1/data-online1x \
+  --data-3x /data/metahuman_work/laya-math-training/online-risk-v1/data-online3x \
+  --base /data/metahuman_work/models/laya/multilingual \
+  --out /data/metahuman_work/laya-math-training/online-risk-v1/frozen \
+  --runtime --objective online-recall --epochs 4
+```
+
+上述 `scripts/` 为工作根目录中同步的脚本目录，不是原始项目的脚本路径。原始基线用同样参数、另选输出目录 `original/` 并添加 `--baseline-only`，不执行训练。报告直接使用 BF16 `Agent.predict` 返回的 `P(online)`，而不是用另一个精度或人工难度字段推断概率。最终结果仍属于开发评估，不能从多轮调参的数据推断未知题正确率。
+
+### online-risk-v1 实测结果
+
+原始模型五折回放、两个采样方案各五折冻结编码器训练（4 epochs）均已完成。门槛仅用每折校准集的四道风险题选择；所有折校准召回率为 100%。测试汇总包含 20 道 online 风险题和 220 道 local 历史安全题：
+
+| 方案（相同风险检测提示词） | 风险召回/20 | online 召回率 | 风险漏判 | local 误转在线/220 | local 误转在线率 | 本地放行/240 |
+|---|---:|---:|---:|---:|---:|---:|
+| 原始 multilingual | 15 | 75% | 5 | 132 | 60.00% | 93 |
+| 冻结编码器，普通采样 | 15 | 75% | 5 | 130 | 59.09% | 95 |
+| 冻结编码器，online 三倍采样 | 15 | 75% | 5 | 135 | 61.36% | 90 |
+
+普通采样仅比原始模型减少两道安全题误转，三倍采样反而增加三道，三者风险召回率没有改善。不能据此宣称微调有效，也不能认为风险题已全部覆盖。若直接使用 P(online)>=0.5，三个方案在本轮测试上风险召回率均为 0%，说明默认分类门槛完全不适合这个风险召回任务；不能只看约 90% 的整体分类准确率。
+
+每折门槛不同，普通采样 P(online) 门槛为 0.042、0.0422、0.071、0.0698、0.063；三倍采样为 0.0451、0.0403、0.0583、0.0851、0.0637。这些是开发校准门槛，不是可直接用于生产的固定风险概率。温度仍由独立校准集的 FP32 logits 拟合，而路由门槛与测试回放均使用 BF16 单题运行时输出；没有声称完成 BF16 logits 的温度重新拟合。
+
+十次训练峰值 PyTorch allocated 最大约 1,496.71 MiB（1.46 GiB），基座权重与配置训练前后哈希一致。两个方案预先固定的 fold-0 checkpoint 已分别在临时 localhost:8000 服务中通过 48 道实际 HTTP 请求：P(online) 门槛为 0.042 和 0.0451，均召回该折测试的四道风险题，但也将 38/44 道安全题误送在线。题目无截断、概率及门槛决策与回放一致、CPU fallback 为 0。测试进程均已关闭，不触碰 233 服务。
+
+230 产物：`/data/metahuman_work/laya-math-training/online-risk-v1/frozen/` 内的各折模型、`summary.json` 和 `http-online1x-fold0.json` / `http-online3x-fold0.json`；原始基线在工作根目录的 `original/summary.json`。轻量报告与日志取回到本地 `data/math-router/online-risk-v1-results/`，不下载模型权重，Git 忽略。
+
+本轮结论是新目标和实验机制已实现，但尚未达到高风险召回、低误转在线的业务目标。新提示词、候选顺序和门槛规则同时变化，因此与旧 local-safe 实验的差异不能单独归因于提示词。仍需更多独立的失败/截断样本及全新测试集；后续可比较严格加权交叉熵和全参数微调，而不是只调整概率门槛。本轮未实现严格加权损失、未执行全参数训练、未部署新模型。
+
+## 全部 20 道 online 参与每折训练：all-online-v1
+
+按用户指定的新协议，每折全部 20 道独立 online 题用于训练，不再分配独立 online 验证或测试题。local 题沿用原来的分组和切分：每折 132 道训练、44 道校准、44 道测试。普通采样训练 152 行；online 三倍采样训练 192 行（132 local + 60 online，后者仍是同样 20 道题）。每模型 4 epochs，仍冻结编码器；两个方案各训练五折。
+
+准备数据时添加 `--all-online-train`：
+
+```bash
+python scripts/train_math_route.py prepare \
+  --source data/math-router/capability-v1-20261010 \
+  --out data/math-router/all-online-v1-online1x --online-repeat 1 \
+  --questions-file scripts/math_online_risk_questions.json --all-online-train
+python scripts/train_math_route.py prepare \
+  --source data/math-router/capability-v1-20261010 \
+  --out data/math-router/all-online-v1-online3x --online-repeat 3 \
+  --questions-file scripts/math_online_risk_questions.json --all-online-train
+```
+
+manifest 明确标记 `protocol=all-online-in-train` 和 `riskCalibrationIsTrainingReplay=true`。原始 sourceManifest 只记录来源切分，不代表派生快照仍有独立 online 测试题。脚本只允许训练/校准之间、且双方标签都为 online 的协议内重叠；local 重叠和训练/测试重叠仍会报错，不全局关闭数据泄漏检查。
+
+`calibration.jsonl` 中包含独立的 44 道 local 校准题和 20 道训练过的 online 风险参考题，共 64 条。这种混合参考集用于拟合温度和选门槛，**不是独立风险校准集**。门槛设为已训练风险题的最小 P(online)，保证这 20 道已知题被送到 online；该覆盖率是选门槛的构造结果，不能据此证明模型学会了识别未知风险。
+
+`test.jsonl` 只包含每折独立的 44 道 local 题。五折汇总时共 220 道不同 local 测试题，能衡量安全题误转在线率；独立风险召回率明确为 null，而不是 100%。报告另列 `trainingRiskReplaySelected` 和 `trainingRiskReplayDefault`，分别记录按选定门槛和默认 P(online)>=0.5 对训练风险题的回放。五折重复出现的 20 道风险题不能计作 100 道独立风险样本。
+
+230 工作目录为 `/data/metahuman_work/laya-math-training/all-online-v1/`；训练使用 `scripts/benchmark_math_route.py --runtime --objective online-recall --epochs 4`，数据在 `data-online1x/` 和 `data-online3x/`，输出在 `frozen/`。基座仍是原始 multilingual，每折重新加载，233 服务不变。
+
+### all-online-v1 实测结果
+
+两个方案各五折、每模型 4 epochs 的冻结编码器微调已完成，已核查每折训练集 online 的独立题面集合与完整 20 道风险题集合一致。普通采样为 132 local + 20 online，三倍采样为 132 local + 60 online 训练行，后者不增加独立题目数量。
+
+| 方案 | 已训练 online 题按选定门槛回放 | 默认 0.5 门槛下已训练 online 识别 | 独立 local 测试误转在线/220 | local 误转在线率 | 独立 local 题留在本地 |
+|---|---|---|---:|---:|---:|
+| 普通采样 | 每折 20/20 | 每折 0/20 | 201 | 91.36% | 19/220 |
+| online 三倍采样 | 每折 20/20 | 每折 0/20 | 189 | 85.91% | 31/220 |
+
+选定门槛下 20/20 是根据同样 20 道训练题选门槛的构造结果，不能称为独立 online 测试召回率。测试集只有 local，因此测试报告的风险题数量为 0、onlineRecall=null。三倍采样比普通采样少误转 12 道安全题，但两者都将大部分安全题送到 online，未达到低误转在线目标。不能把高 local 分类准确率或训练题全覆盖解读为路由训练成功。
+
+与此前 online-risk-v1 的结果不能作同口径风险召回比较：此前保留未训练风险测试题，本轮没有。本轮为了覆盖完整 20 道已知风险题，门槛由其中最低风险分数确定，误转安全题较多，不仅是采样比例的影响。
+
+运行时回放为 BF16 单题 `Agent.predict`，温度拟合和门槛选取均使用明确标记的混合参考集（其中 online 题已训练）。原始模型权重与配置训练前后哈希一致，未部署到 233。
+
+服务器 checkpoint：`/data/metahuman_work/laya-math-training/all-online-v1/frozen/online1x/fold-0..4/` 和 `online3x/fold-0..4/`，汇总为 `frozen/summary.json`。本地轻量报告与日志为 `data/math-router/all-online-v1-results/`，数据/权重不提交 Git。
+
+两个方案预先固定的 fold-0 checkpoint 分别通过临时 HTTP 回放：44 道独立 local 测试题，加 20 道已训练 online 题，共 64 次请求；风险回放与 local 独立测试分别记录。检查包括无截断、无 CPU fallback、概率和门槛决策与运行时回放一致，临时测试进程最后关闭。
+
+## 增加至 20 epochs：all-online-v1 对照实验
+
+2026-10-10 按用户要求，在 230 将训练轮数从 4 增加至 20。普通采样和 online 三倍采样各训练五折，每折重新加载原始 multilingual，不从四轮模型续训。与对应四轮报告逐项核查：训练配置仅 `epochs` 不同，数据 manifest 哈希相同，每折独立 local 测试题的题面哈希集合相同。
+
+保持冻结编码器、soft-ce、候选顺序打乱、固定种子、学习率、micro-batch 2、梯度累积 8 和风险检测提示词不变。普通采样每轮 152 行、10 次优化器更新，20 轮共 200 次更新；三倍采样每轮 192 行、12 次更新，共 240 次更新。余弦学习率调度随总更新数延长；本轮比较的是完整训练预算增加，并非保持前四轮学习率轨迹不变的续训实验。
+
+本轮使用 230 上 all-online-v1 已有包装脚本；`benchmark_math_route.py` SHA-256 为 `a3f1f3fbd92ceee7d26a8fc5607846b842ab911bcadff40645efddecf2bdf4f0`，`train_math_route.py` 为 `caf4d1c254c10bfed6bdcf3897687aac4a0ba622c873d52635550a0d1bc41551`。后者早于本地补充解释性元数据的版本，回放报告中的通用“四道风险校准题”文字不适用于此协议；实际计数均为 20 道训练风险题，且明确标记 `riskCalibrationIsTrainingReplay=true`，不能当作独立风险校准。
+
+复现命令（再次运行必须更换输出目录）：
+
+```bash
+PYTHONPATH=/data/metahuman_work/laya HF_HUB_OFFLINE=1 \
+  /data/qianyong/miniconda3/envs/laya/bin/python -u \
+  /data/metahuman_work/laya-math-training/all-online-v1/scripts/benchmark_math_route.py \
+  --data-1x /data/metahuman_work/laya-math-training/all-online-v1/data-online1x \
+  --data-3x /data/metahuman_work/laya-math-training/all-online-v1/data-online3x \
+  --base /data/metahuman_work/models/laya/multilingual \
+  --out /data/metahuman_work/laya-math-training/all-online-v1/frozen-epochs20 \
+  --runtime --objective online-recall --epochs 20
+```
+
+### 实测比较
+
+每折仍以同样 20 道训练风险题的最小 `P(online)` 选门槛，确保已知风险题全覆盖；五折测试汇总只包含 220 道不同 local 题，不包含独立 online 风险题。BF16 单题运行时结果如下：
+
+| 采样方案 | 训练轮数 | 独立 local 误转在线/220 | local 误转在线率 | 独立 local 留在本地/220 |
+|---|---:|---:|---:|---:|
+| 普通采样 | 4 | 201 | 91.36% | 19（8.64%） |
+| 普通采样 | 20 | 153 | 69.55% | 67（30.45%） |
+| online 三倍采样 | 4 | 189 | 85.91% | 31（14.09%） |
+| online 三倍采样 | 20 | 86 | 39.09% | 134（60.91%） |
+
+普通采样增加轮数后少误转 48 道 local；三倍采样少误转 103 道，误转率下降 46.82 个百分点。三倍采样二十轮在本次开发对照中明显更好，但没有运行多随机种子，也没有新的独立风险测试，不能视为泛化或生产正确率保证。
+
+默认 `P(online)>=0.5` 时，普通采样二十轮的每折训练风险识别仍为 0/20；三倍采样二十轮五折分别为 10/20、8/20、9/20、9/20、10/20，相比四轮全部 0/20 有改善，但仍漏掉部分已知风险。五折重复的是同样 20 道题，不能将其合并为 100 道独立风险样本。选定低门槛后的 20/20 仍是门槛构造结果，而非未知风险召回率。
+
+普通采样五折门槛为 0.1886、0.2056、0.2168、0.2233、0.191；三倍采样为 0.0908、0.1373、0.0754、0.1、0.1574，不应挑选测试效果最好的一折或直接复用其中某个门槛到生产。三倍采样各折第一轮平均损失约 0.629–0.651，最终约 0.360–0.384，说明额外训练预算确实降低了训练损失；不能单凭损失下降认定泛化有效。
+
+温度仍在 FP32 的混合参考集拟合（44 道独立 local 加 20 道训练 online）；随后在 BF16 运行时输出上选阈值、评估。增加轮数没有解决训练风险参与温度拟合、缺少独立风险测试、校准精度与服务精度不一致等既有局限。测试报告的 `onlineRecall` 仍为 null，且题目此前用于多轮开发实验；正式宣称 98% 解题正确率需要新的独立题集和实际解题评估。
+
+十次训练的 PyTorch 峰值 allocated 最大 1,497.86 MiB（约 1.46 GiB）；训练及前后 FP32 评估耗时累计约 184.58 秒，不含加载、保存、运行时回放和 HTTP 测试。全部 240 道题无输入截断。两个预先固定的 fold-0 checkpoint 各执行 64 次实际 HTTP 请求并通过检查，CPU fallback 为 0、概率和门槛决策与运行时回放一致，临时进程均已关闭。原始权重和配置哈希未变，233 生产服务未访问、未修改。
+
+230 checkpoint 和汇总在 `/data/metahuman_work/laya-math-training/all-online-v1/frozen-epochs20/`；本地评估报告在 `data/math-router/all-online-v1-epochs20-results/summary.json`。本轮未部署模型，下一步应优先补充独立风险校准/测试题，并对照全参数微调，而不是仅凭已知题覆盖部署。
+
+## 第二版：题面难度三分类（difficulty-threeclass-v1）
+
+按用户接受暂不保证 98% 解题正确率后的新目标，训练任务改为 `math_difficulty: simple/medium/difficult`。标签来自 MongoDB `questions.difficulty`，将“压轴”并入“困难”。模型只输入原始题面及固定任务说明，不输入难度元数据、参考答案、历史模型回答或评估结果。脚本为 `scripts/train_math_difficulty.py`，权重无关检查为 `python scripts/test_train_math_difficulty.py`。
+
+2026-10-10 数据快照共有 665 道：简单 50、中等 145、困难 466、压轴 4。正式本地评估仍为 250 道、750 次，均对应 `nvidia/Qwen3.6-35B-A3B-NVFP4`，评估版本 `evaluator-v1`；新增题没有正式本地答题结果，不能计作本地正确。按已判定推理统计，简单错误 1/149（0.67%，另有一次 review）、中等错误 18/428（4.21%，另有七次 review）。历史答错率不是未知题正确率保证。
+
+首次基线回放在 fold-0 因题面截断而停止，尚未训练出模型。使用原始 tokenizer、固定三分类提示词以及 `max_len=1024`、`head_max_len=256` 检查全部 665 道后，确定只有两道题超出当前题面预算 871 tokens：
+
+| 排除题目 ID | 题面 tokens | 丢弃 tokens | 内容 |
+|---|---:|---:|---|
+| `ZP-MATH-5_4_27` | 945 | 74 | 企业研发投入与销售收入的回归分析 |
+| `ZP-MATH-5_7_34` | 968 | 97 | 最大似然估计与数列求和 |
+
+按用户要求只从此实验数据中排除这两道，不删除 MongoDB 原始题目、不改写题面、不扩大 token 预算。新快照保留 `excluded.jsonl` 和 manifest 排除记录；重新执行固定种子的分组五折切分，同一规范化题面的重复题仍在同一桶内。未过滤快照和失败日志保留，后续训练仍拒绝新的截断，不静默丢弃更多题。
+
+```bash
+python scripts/train_math_difficulty.py export \
+  --out data/math-router/difficulty-threeclass-v1-filtered \
+  --exclude-question-id ZP-MATH-5_4_27 \
+  --exclude-question-id ZP-MATH-5_7_34
+```
+
+过滤后共 663 道：简单 50、中等 145、困难 468。每折原始训练 397–398 道，校准与测试各 132–133 道，三个集合互不重叠。仅训练集按三类均衡重复采样扩为 840–843 行（每类 280–281 行），不产生新的独立题；校准、测试保持原始类别分布。这是首轮冻结编码器基线，20 epochs、soft-ce、micro-batch 2、梯度累积 8、head_lr=1e-4、固定种子、随机候选顺序；不是全参数训练，也不是固定更新数的纯采样消融。
+
+```bash
+PYTHONPATH=/data/metahuman_work/laya HF_HUB_OFFLINE=1 \
+  /data/qianyong/miniconda3/envs/laya/bin/python -u \
+  /data/metahuman_work/laya-math-training/difficulty-threeclass-v1/scripts/train_math_difficulty.py benchmark \
+  --data /data/metahuman_work/laya-math-training/difficulty-threeclass-v1/data-filtered \
+  --base /data/metahuman_work/models/laya/multilingual \
+  --out /data/metahuman_work/laya-math-training/difficulty-threeclass-v1/frozen-epochs20-filtered \
+  --epochs 20
+```
+
+每折比较原始 multilingual 与微调模型的实际 `Agent.predict` 三分类结果。微调权重保存后，使用单题运行时的原始 logits，仅在独立校准集拟合温度，再加载持久化配置进行测试；不再采用之前实验的 FP32 训练路径温度拟合。按最高概率类别固定比较“仅简单走 local”和“简单＋中等走 local”两个规则，不继承旧模型的 0.7 或 0.0908 门槛。
+
+路由评估分别报告覆盖率、被放行且有历史评估的题数、被放行但未评估的题数、已判定推理错误率和 review 次数。未评估题不进入答错率分母；不将历史推理错误率当作在线兜底后的端到端解题正确率。250 条记录带有截图路径，不等于题面都依赖图片，但题面是否缺少图形条件仍需人工审查；此轮不读取图片。模型仍在开发阶段，不自动部署到当前 230 或 233 服务。
+
+### 过滤后实测结果（2026-10-10）
+
+663 道题的分组五折、每折 20 轮冻结编码器训练已完成。所有保留题完整输入最长 972 tokens，无题面截断；两个超长题的原始题库记录保留，仅在本轮实验快照排除。已核查五折测试题 ID 恰好覆盖 663 道、各一次，且规范化题面在每折训练/校准/测试之间不重叠。基座原始权重和配置哈希保持不变。
+
+| 指标 | 相同三分类提示词的未微调基线 | 三分类微调 |
+|---|---:|---:|
+| 测试准确率 | 13.57% | 77.38% |
+| 宏平均召回率（平衡准确率） | 33.21% | 62.13% |
+| 简单召回率 | 90.00% | 38.00% |
+| 中等召回率 | 0.00% | 62.07% |
+| 困难召回率 | 9.62% | 86.32% |
+
+这里的未微调基线是原始 multilingual 对新三分类提示词的最高概率分类，不是生产 difficulty-v3 二分类加 0.7 门槛。五折微调测试准确率依次为 77.44%、73.48%、75.94%、77.27%、82.71%。由于困难类别占比高，“全部预测困难”的准确率也有 70.59%，不能只看微调前后整体准确率增幅。
+
+微调后的混淆计数如下；简单、中等类别的界限仍不理想，预测简单的 72 道中实际简单只有 19 道，不能把“预测简单”当作“历史安全”标签。
+
+| 原始难度 | 预测简单 | 预测中等 | 预测困难 |
+|---|---:|---:|---:|
+| 简单（50） | 19 | 27 | 4 |
+| 中等（145） | 34 | 90 | 21 |
+| 困难（468） | 19 | 45 | 404 |
+
+两个固定路由策略在微调后五折测试结果上的比较：
+
+| 本地放行规则 | 放行/663 | 覆盖率 | 有历史评估的放行题 | 无评估的放行题 | 已判定推理错误率 | 待审核推理 |
+|---|---:|---:|---:|---:|---:|---:|
+| 仅预测简单 | 72 | 10.86% | 67 | 5 | 10/198＝5.05% | 3 |
+| 预测简单或中等 | 234 | 35.29% | 215 | 19 | 26/633＝4.11% | 12 |
+
+前者有 7 道、后者有 20 道放行题曾至少一次本地答错。第二种策略在此历史子集的错误率更低，不代表它普遍比第一种更安全：两个放行集合不同、分母不同，模型也会把部分困难题错判简单。全部预测结果包含尚未评估的新增题，它们不进入错误率分母；review 不计作正确或错误。没有重新运行解题模型，也没有验证在线兜底后的端到端正确率。
+
+原始三分类基线的“简单＋中等”覆盖率为 90.65%，被放行且有评估的题为 226 道，已判定推理错误率 28/667＝4.20%。因此本次微调确实提高了难度标签分类，但该规则的历史作答错误率只从 4.20% 变为 4.11%，同时覆盖率明显下降；不能宣称业务路由安全性已明显提升。两种难度路由规则可作为新的开发实验，仍需新增本地推理和独立题集验证。
+
+实际校准使用保存后的 FP16 权重、BF16 单题 `Agent` logits，五折报告的 `calibrationDtype` 均为 `torch.bfloat16`。训练阶段峰值 PyTorch allocated 最大 1,552.05 MiB（约 1.52 GiB）；累计训练约 465.04 秒，不含加载、保存、基线与最终回放、温度拟合等阶段。230 原有 8000 服务健康、CUDA 正常、CPU fallback 为 0；本轮训练进程已退出，没有替换当前服务或访问 233。
+
+230 产物：`/data/metahuman_work/laya-math-training/difficulty-threeclass-v1/frozen-epochs20-filtered/fold-0..4/`，汇总 `summary.json`。本地仅保存报告和日志：`data/math-router/difficulty-threeclass-v1-filtered-results/`。后续若部署，应预先固定模型及路由规则，不按测试成绩挑选最好的一折；未知题输入超长时应明确兜底处理，不依赖模型读取截断题面。
+
+## 三分类最终模型：全部 663 道题训练
+
+按用户要求，固定已有参数，用过滤后全部 663 道题训练最终模型：简单 50、中等 145、困难 468。仍从原始 multilingual 加载，而不是续训或选取某折权重。冻结编码器、soft-ce、20 epochs、micro-batch 2、梯度累积 8、head_lr=1e-4、seed=20261010、候选顺序打乱、max_len=1024、head_max_len=256 均不变。三类均衡重复采样每轮 1,404 行（各 468 行），20 轮共 1,760 次优化器更新；原始不同题目数仍为 663，重复采样不创造新题。
+
+```bash
+PYTHONPATH=/data/metahuman_work/laya HF_HUB_OFFLINE=1 \
+  /data/qianyong/miniconda3/envs/laya/bin/python -u \
+  /data/metahuman_work/laya-math-training/difficulty-threeclass-v1/scripts/train_math_difficulty.py final \
+  --data /data/metahuman_work/laya-math-training/difficulty-threeclass-v1/data-filtered \
+  --base /data/metahuman_work/models/laya/multilingual \
+  --out /data/metahuman_work/laya-math-training/difficulty-threeclass-v1/final-all663-epochs20 \
+  --epochs 20
+```
+
+全量训练没有剩余独立校准/测试题，报告明确标记 `protocol=all-data-final`、`independentEvaluationAvailable=false`。原始模型与新模型的全量回放分别记录为 `baselineTrainingReplay` 和 `trainingReplay`，不使用独立测试字段名。五折结果用于描述此前训练方案的开发表现，不能冒充最终模型的独立评估。
+
+本轮不在训练题上拟合温度，不沿用任何一折的温度或概率门槛。保存 `temperature=[1,1,1]`、清除旧分桶温度，报告标记 `calibrationStatus=not-fitted-no-independent-data` 和 `probabilitiesCalibrated=false`。只按最高概率类别路由时温度不影响类别选择，但概率值不能视为校准后的真实可靠程度；将来若使用置信度门槛，需提供未参与全量训练的新校准题。不能直接复用历史 0.7 或 0.0908 门槛。
+
+本轮产物写入独立目录，保留原始 checkpoint、五折模型与失败日志，不自动替换当前 230 的 fold-0 服务，也不访问 233。
+
+### 最终模型训练完成（2026-10-10）
+
+`final-all663-epochs20` 已训练并保存成功，核查实际训练包含全部 663 道题、每轮 1,404 行且三类各 468 行，配置仍为 20 轮冻结编码器。完整输入最长 972 tokens，无截断；损失从第一轮 1.1410 降至最后一轮 0.3155，训练耗时约 154.68 秒（不含加载、保存及回放），峰值 PyTorch allocated 1,554.18 MiB（约 1.52 GiB）。原始权重和配置哈希未变。
+
+保存后重新加载，并用真实 `Agent.predict` 对全部训练题单题回放：难度标签准确率 90.95%、宏平均召回率 93.07%；简单召回 98.00%、中等召回 91.03%、困难召回 90.17%。这些都是 **训练题回放**，不能与此前五折 77.38% 的独立折内测试成绩直接比较，更不能视作最终模型的泛化准确率或数学解题正确率。
+
+| 最终模型训练题回放规则 | 本地放行/663 | 覆盖率 | 有历史评估的放行题 | 未评估放行题 | 历史已判定推理错误率 | review 次数 |
+|---|---:|---:|---:|---:|---:|---:|
+| 仅预测简单 | 75 | 11.31% | 75 | 0 | 2/223＝0.90% | 2 |
+| 预测简单或中等 | 240 | 36.20% | 237 | 3 | 25/701＝3.57% | 10 |
+
+上述解题评估是训练题的既有本地推理结果，并非用最终路由系统重新解题。分别有 2 道和 20 道放行题至少一次本地答错。模型学习难度标签而非作答能力，仍可能将困难题预测为简单；全部题参与训练后，没有剩余独立校准或测试数据，不据此选择新门槛。
+
+直接重新加载最终模型测试“求方程 x² − 5x + 6 = 0 的解。”，返回 `simple`，概率 simple=0.7282、medium=0.0462、difficult=0.2256，无截断。这是 SDK 直接调用测试，不是当前 8000 服务的返回；服务仍加载三分类 fold-0。温度保持 1.0，概率尚未独立校准，不能将 72.82% 当作可靠性或答对概率。
+
+最终模型目录：`/data/metahuman_work/laya-math-training/difficulty-threeclass-v1/final-all663-epochs20/`，其中包含权重、编码器/分词器、任务原文、训练报告和全量回放。轻量报告保存到本地 `data/math-router/difficulty-threeclass-final-all663-results/`。本轮未部署最终模型，230 当前服务和 233 均未替换；后续使用概率门槛前需补充独立校准数据。
+
+### 随后按用户要求切换 230 服务
+
+已将 230 的 8000 服务从三分类 fold-0 切换为最终全量模型，模型别名仍为 `multilingual`。实际 HTTP 请求确认 `routing.repo` 指向 `final-all663-epochs20`；方程题返回简单 72.82%、中等 4.62%、困难 22.56%，与 SDK 直接加载一致，无截断、CUDA 正常、无 CPU fallback。服务保持后台运行，日志位于最终模型目录的 `serve-final.log`，未配置开机自启；原始与五折 checkpoint 均保留，233 未改动。此切换是用户授权的测试服务变更，不构成独立泛化评估或概率校准。

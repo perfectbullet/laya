@@ -1,5 +1,7 @@
 # Laya 部署报告（230 / 233，最终版）
 
+当前 230 测试环境版本固定为 `final-all663-epochs20`，任务为数学难度三分类，验收关注人工难度标签的一致性，不关注解题模型是否答对。接口用法和参数迁移见 `docs/math-difficulty-test-api.zh-CN.md`，分类指标见 `docs/math-router-finetune.zh-CN.md` 开头的当前评估目标。此前 local/online 和解题错误率内容保留为历史实验记录。233 生产服务未变更。
+
 报告日期：2026-10-09（Asia/Shanghai）；2026-10-10 补充 230 驱动修复后的实测与训练条件。  
 核查方式：通过 `zenking` 账户进行只读 SSH 检查；不记录 API Key、HF Token 或其他密钥值。
 
@@ -179,3 +181,53 @@ Authorization: Bearer <LAYA_API_KEY>
 各折门槛仅由校准集选择，不使用测试标签调门槛。表内比例不等于最终 solver 正确率，也不是既有难度 v3 生产策略的对照。这次冻结基线尚无充分生产替换依据。
 
 已在 230 临时 localhost:8000 测试服务中依次把 `multilingual` 映射到两个方案预先指定的 fold-0 checkpoint，各执行 48 道真实 `/v1/systemone` HTTP 请求。health 显示 CUDA，CPU fallback 0；输入无截断，概率与运行时回放一致。两个方案按自己的校准门槛分别放行 7 道、8 道，没有历史风险误放行。临时测试进程已关闭，没有覆盖原始模型或留下常驻测试服务。233 生产服务未访问、未修改。完整复现命令和结论见 `docs/math-router-finetune.zh-CN.md`。
+
+## 后续实验：online-risk-v1
+
+230 已完成风险检测提示词的原始模型五折回放，以及普通采样/online 三倍采样两个方案的五折冻结编码器微调（各 4 epochs）。标签和题目切分不变；门槛改为校准集风险题 P(online) 的最小值，确保校准风险题全部走 online，并尽量减少安全题误转。该规则不保证未知题零漏判。
+
+实际 BF16 运行时五折测试均只召回 15/20 道风险题（75%），漏判 5 道。原始模型、普通采样微调、三倍采样微调分别误转 132/220、130/220、135/220 道历史安全题。没有充分证据支持部署；233 服务保持不变。
+
+新实验产物独立保存在 `/data/metahuman_work/laya-math-training/online-risk-v1/`。训练峰值 PyTorch allocated 最大约 1.46 GiB，原始权重和配置哈希不变。两种微调方案各完成 48 道临时 HTTP 检查，概率/阈值决策一致、无截断、无 CPU fallback，测试进程已关闭。三倍采样是训练曝光加权，不是严格 weighted-CE 损失；未改变 Laya 公共训练 API，未进行全参数训练。详细表格和命令见中文训练文档的 online-risk-v1 章节。
+
+## 后续实验：全部 20 道 online 参与每折训练
+
+按用户要求，在 230 的 `/data/metahuman_work/laya-math-training/all-online-v1/` 重做两个方案各五折训练，每模型 4 epochs、冻结编码器。每折训练包含原来的 132 道 local 加全部 20 道独立 online；三倍采样重复 online 为 60 行。local 校准/测试各保持原来的 44 道。没有独立 online 测试样本。
+
+online 门槛参考题是同样 20 道已训练题，与 44 道 local 校准题组成混合参考集，明确标记 `riskCalibrationIsTrainingReplay=true`。这个集合的温度拟合和阈值选择不是独立风险校准；训练风险题按门槛回放 20/20 是选阈值的构造结果，不能证明未知风险召回。
+
+五折独立 local 测试共 220 道，普通采样误转在线 201 道（91.36%），三倍采样 189 道（85.91%）。默认 P(online)>=0.5 时各模型对训练风险题均识别 0/20；未形成可用生产替换依据。测试的 onlineRecall 为 null，未伪称 100%。产物在 `all-online-v1/frozen/`，原始权重/配置哈希不变。
+
+两个方案预先固定的 fold-0 checkpoint 各执行 64 次临时 HTTP 请求，分别报告 44 道独立 local 测试和 20 道 online 训练题回放；检查通过后关闭自己创建的进程。233 生产服务仍未修改。复现参数、评估局限与结果见中文训练文档的 all-online-v1 章节。
+
+### 2026-10-10：增加至 20 轮的训练对照
+
+230 在独立目录 `/data/metahuman_work/laya-math-training/all-online-v1/frozen-epochs20/` 完成普通采样和 online 三倍采样各五折、每模型 20 epochs 的冻结编码器训练，仍从原始 multilingual 重新训练。与四轮对应方案的训练配置仅轮数不同，数据 manifest 和各折测试题集合一致；原始模型未覆盖。
+
+独立 local 测试共 220 道：普通采样误转在线由四轮的 201 道降至 153 道（69.55%），三倍采样由 189 道降至 86 道（39.09%），三倍采样留在本地的题由 31 道增至 134 道。默认 0.5 门槛下，三倍采样各折训练风险识别为 8–10/20；使用训练风险最小概率选门槛后仍为 20/20，此数值不是独立未知风险召回率。没有新增独立 online 校准或测试样本，温度仍采用混合参考集的 FP32 拟合，本轮不能证明生产解题正确率达到 98%。
+
+峰值 PyTorch allocated 最大约 1.46 GiB；两个预先固定的 fold-0 各通过 64 次 HTTP 请求，未截断、无 CPU fallback，临时服务和训练进程均已退出。结束后 GPU 已用 1 MiB、空闲 15,945 MiB，数据盘空闲约 88 GiB。233 未访问或修改，本轮不部署模型。详细命令、四轮/二十轮对比与局限见 `docs/math-router-finetune.zh-CN.md` 的二十轮章节。
+
+### 2026-10-10：第二版难度三分类，过滤超长题
+
+从 MongoDB 导出 665 道人工难度标签题，将压轴归入困难。按用户要求，排除超过本轮题面预算的 `ZP-MATH-5_4_27` 和 `ZP-MATH-5_7_34`，仅影响实验快照，不删除题库记录。剩余 663 道（简单 50、中等 145、困难 468），完整输入最长 972 tokens，低于总上限 1024。
+
+在 `/data/metahuman_work/laya-math-training/difficulty-threeclass-v1/frozen-epochs20-filtered/` 完成分组五折、每模型 20 轮冻结编码器训练。仅训练集均衡三类重复采样，校准/测试自然分布且完全独立；温度使用保存后模型的 BF16 实际运行时 logits 拟合。测试准确率 77.38%、宏平均召回率 62.13%；同三分类提示词的原始模型准确率 13.57%，不是旧二分类生产方案的直接对照。
+
+“简单＋中等”走 local 放行 234/663（35.29%），其中 215 道有历史本地评估，已判定推理错误率 26/633（4.11%），另 19 道无评估、12 次 review。仅简单走 local 放行 72/663，历史已判定错误率 10/198（5.05%）。这些是历史子集指标，不是端到端或未知题正确率；困难题仍会被误判简单。
+
+训练峰值 PyTorch allocated 最大约 1.52 GiB，训练进程已退出。原始 multilingual 哈希不变；230 原有 8000 服务健康、CUDA 正常、无 CPU fallback。本轮三分类模型没有部署，233 未访问或修改。完整排除记录、切分、混淆矩阵和局限见中文训练文档的第二版章节。
+
+### 2026-10-10：663 道全量最终模型
+
+按用户要求固定已验证的参数，在 `/data/metahuman_work/laya-math-training/difficulty-threeclass-v1/final-all663-epochs20/` 完成最终训练：全部 663 道题，三类均衡采样后每轮 1,404 行，20 轮冻结编码器，从原始 multilingual 重新训练，不续训 fold-0。原始模型及五折权重保留；训练阶段峰值 PyTorch allocated 约 1.52 GiB，训练约 154.68 秒。
+
+全量训练题回放难度准确率 90.95%，不是独立测试或解题正确率。没有独立校准集，因此温度明确设为 1.0、不沿用五折温度，报告标记 `probabilitiesCalibrated=false`、`independentEvaluationAvailable=false`。最高概率路由无需依赖旧的概率门槛，但若要用置信度放行，须先补充新校准题。
+
+保存后重新加载最终模型，直接调用 SDK 测试二次方程题，返回简单（simple=0.7282、medium=0.0462、difficult=0.2256），无截断。本轮没有替换 230 当前三分类 fold-0 服务，也没有访问或修改 233。全量回放、标签与训练配置见最终目录的报告；本地轻量报告在 `data/math-router/difficulty-threeclass-final-all663-results/`。
+
+### 2026-10-10：最终模型服务切换与 HTTP 测试
+
+随后按用户明确要求，核实并停止 230 原 fold-0 服务进程 157059，保留其 checkpoint，将 `multilingual` 映射切换到 `/data/metahuman_work/laya-math-training/difficulty-threeclass-v1/final-all663-epochs20/`。服务以独立后台进程监听 `0.0.0.0:8000`，对外地址 `http://192.168.100.230:8000`；日志为最终模型目录的 `serve-final.log`。这是运行中的后台进程，不是已配置开机自启的服务。
+
+实际 POST `/v1/systemone` 使用训练时相同三分类任务说明，题面为“求方程 x² − 5x + 6 = 0 的解。”，返回 simple=0.7282、medium=0.0462、difficult=0.2256，选择 simple；返回的 `routing.repo` 确认为最终模型目录，与之前 SDK 测试一致。输入 171 tokens、题面 18 tokens，无截断；health 显示 CUDA、CPU fallback 为 0。按最高概率分类，两种难度路由规则均将此题送 local；接口只判断难度，未调用解题模型。概率尚未独立校准，不是实际答对率。233 未访问或修改，旧模型文件未删除。
